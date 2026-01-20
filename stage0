@@ -1,0 +1,13 @@
+name <- "Mayssam Eid"
+affiliation <- "Bioinformatics senior student at the Lebanese American University in Lebanon"
+favorite_gene <- "TP53"
+organism <- "Homo sapiens"
+
+cat(
+  paste(
+    "Hi, my name is", name,
+    ", a", affiliation,
+    ". My favorite gene is", favorite_gene,
+    "in", organism, "."
+  )
+)
