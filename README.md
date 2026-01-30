@@ -1,4 +1,4 @@
-# HackBio-stage0
+# HackBio
 introductory stage: technical writing and simple coding
 # Learning Experience
 This stage helped me think more intentionally about how biological data is presented. Writing the technical piece pushed me to explain concepts such as color bias and accessibility in genomics in a way that could be understood by both technical and non-technical audiences. It reinforced the idea that clarity is just as important as correctness when communicating scientific results.
