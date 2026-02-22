@@ -1,0 +1,251 @@
+library(shiny)
+library(ggplot2)
+library(dplyr)
+
+t_col <- function(color, percent = 50, name = NULL) {
+  rgb.val <- col2rgb(color)
+  t.col <- rgb(
+    rgb.val[1], rgb.val[2], rgb.val[3],
+    max = 255,
+    alpha = (100 - percent) * 255 / 100,
+    names = name
+  )
+  invisible(t.col)
+}
+
+scale_0_100 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (rng[1] == rng[2]) return(rep(50, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1]) * 100
+}
+
+compute_gene_stats <- function(expr_mat, meta_df, target_ct) {
+  in_cells  <- meta_df$cell_id[meta_df$cell_type == target_ct]
+  out_cells <- meta_df$cell_id[meta_df$cell_type != target_ct]
+  
+  xin  <- expr_mat[in_cells, , drop = FALSE]
+  xout <- expr_mat[out_cells, , drop = FALSE]
+  
+  det_in  <- colMeans(xin > 0, na.rm = TRUE)
+  det_out <- colMeans(xout > 0, na.rm = TRUE)
+  
+  # Mean expression
+  mean_in  <- colMeans(xin, na.rm = TRUE)
+  mean_out <- colMeans(xout, na.rm = TRUE)
+  
+  # Specificity difference
+  diff <- mean_in - mean_out
+  
+  data.frame(
+    gene = colnames(expr_mat),
+    det_in = det_in,
+    det_out = det_out,
+    mean_in = mean_in,
+    mean_out = mean_out,
+    diff = diff,
+    stringsAsFactors = FALSE
+  )
+}
+
+pick_marker_gene <- function(gene_stats_df) {
+  gene_stats_df <- gene_stats_df %>%
+    arrange(desc(diff), desc(det_in), gene)
+  gene_stats_df$gene[1]
+}
+
+load_inputs <- function() {
+  required_files <- c("expression_matrix.csv", "cell_metadata.csv", "umap_coordinates.csv")
+  missing <- required_files[!file.exists(required_files)]
+  if (length(missing) > 0) {
+    stop(
+      "Missing file(s): ", paste(missing, collapse = ", "),
+      "\nPut them in the SAME folder as app.R."
+    )
+  }
+  
+  expr_df <- read.csv("expression_matrix.csv", check.names = FALSE, stringsAsFactors = FALSE)
+  meta_df <- read.csv("cell_metadata.csv", stringsAsFactors = FALSE)
+  umap_df <- read.csv("umap_coordinates.csv", stringsAsFactors = FALSE)
+  
+  if (!all(c("cell_id", "cell_type") %in% colnames(meta_df))) {
+    stop("cell_metadata.csv must contain: cell_id, cell_type (cluster optional).")
+  }
+  if (!all(c("cell_id", "UMAP_1", "UMAP_2") %in% colnames(umap_df))) {
+    stop("umap_coordinates.csv must contain: cell_id, UMAP_1, UMAP_2.")
+  }
+  
+  if (!("cell_id" %in% colnames(expr_df))) {
+    # assume first column holds cell IDs
+    colnames(expr_df)[1] <- "cell_id"
+  }
+  
+  expr_df$cell_id <- as.character(expr_df$cell_id)
+  meta_df$cell_id <- as.character(meta_df$cell_id)
+  meta_df$cell_type <- as.character(meta_df$cell_type)
+  umap_df$cell_id <- as.character(umap_df$cell_id)
+  
+  expr_df <- expr_df[!duplicated(expr_df$cell_id), , drop = FALSE]
+  meta_df <- meta_df[!duplicated(meta_df$cell_id), , drop = FALSE]
+  umap_df <- umap_df[!duplicated(umap_df$cell_id), , drop = FALSE]
+  
+  expr_mat <- expr_df
+  rownames(expr_mat) <- expr_mat$cell_id
+  expr_mat$cell_id <- NULL
+  expr_mat <- as.matrix(expr_mat)
+  storage.mode(expr_mat) <- "numeric"
+  
+  common_ids <- Reduce(intersect, list(rownames(expr_mat), meta_df$cell_id, umap_df$cell_id))
+  if (length(common_ids) == 0) stop("No overlapping cell IDs across the three files.")
+  
+  expr_mat <- expr_mat[common_ids, , drop = FALSE]
+  meta_df  <- meta_df[match(common_ids, meta_df$cell_id), , drop = FALSE]
+  umap_df  <- umap_df[match(common_ids, umap_df$cell_id), , drop = FALSE]
+  
+  stopifnot(identical(rownames(expr_mat), meta_df$cell_id))
+  stopifnot(identical(meta_df$cell_id, umap_df$cell_id))
+  
+  list(expr_mat = expr_mat, meta_df = meta_df, umap_df = umap_df)
+}
+
+inputs <- load_inputs()
+
+base_umap <- inputs$meta_df %>%
+  left_join(inputs$umap_df, by = "cell_id")
+
+cell_types <- sort(unique(base_umap$cell_type))
+
+ui <- fluidPage(
+  tags$head(tags$style(HTML("
+    body { font-family: Arial, sans-serif; }
+    .title { font-weight: 800; margin-top: 10px; }
+    .subtitle { color: #555; margin-bottom: 15px; }
+    .box { background: #f7f7fb; border-radius: 12px; padding: 12px; }
+  "))),
+  
+  div(class = "title", h2("Cell Type Snapshot Explorer (Shiny, minimal scRNA-seq)")),
+  div(class = "subtitle", "Explore best marker genes and visualize marker signal on a UMAP embedding."),
+  
+  sidebarLayout(
+    sidebarPanel(
+      div(class = "box",
+          selectInput(
+            inputId = "cell_type",
+            label = "Select Cell Type",
+            choices = c("All" = "All", cell_types),
+            selected = "All"
+          ),
+          helpText("All: UMAP colored by cell type. Otherwise: UMAP colored by best marker gene expression (0–100).")
+      )
+    ),
+    mainPanel(
+      plotOutput("umap_plot", height = 420),
+      verbatimTextOutput("marker_text"),
+      tags$hr(),
+      h4("Per-gene statistics for selected cell type"),
+      tableOutput("gene_table")
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  # Recompute stats when cell type changes
+  gene_stats <- reactive({
+    req(input$cell_type)
+    if (input$cell_type == "All") return(NULL)
+    
+    gs <- compute_gene_stats(inputs$expr_mat, inputs$meta_df, input$cell_type)
+    
+    gs <- gs %>% arrange(desc(diff), desc(det_in), gene)
+    gs
+  })
+  
+  marker_gene <- reactive({
+    if (is.null(gene_stats())) return(NA_character_)
+    pick_marker_gene(gene_stats())
+  })
+  
+  marker_diff <- reactive({
+    if (is.null(gene_stats())) return(NA_real_)
+    g <- marker_gene()
+    gene_stats()$diff[match(g, gene_stats()$gene)]
+  })
+  
+  plot_df <- reactive({
+    df <- base_umap
+    
+    if (input$cell_type == "All") {
+      df$mode <- "celltype"
+      return(df)
+    }
+    
+    g <- marker_gene()
+    df$mode <- "marker"
+    
+    if (is.na(g) || !(g %in% colnames(inputs$expr_mat))) {
+      df$marker_scaled <- NA_real_
+      return(df)
+    }
+    
+    expr_vec <- inputs$expr_mat[, g]
+    df$marker_scaled <- scale_0_100(expr_vec)
+    df
+  })
+  
+  output$umap_plot <- renderPlot({
+    df <- plot_df()
+    
+    if (df$mode[1] == "celltype") {
+      ggplot(df, aes(x = UMAP_1, y = UMAP_2, color = cell_type)) +
+        geom_point(size = 2, alpha = 0.85) +
+        labs(x = "UMAP 1", y = "UMAP 2", color = "Cell type") +
+        theme_minimal(base_size = 13) +
+        theme(legend.position = "bottom", panel.grid.minor = element_blank())
+    } else {
+      ggplot(df, aes(x = UMAP_1, y = UMAP_2, color = marker_scaled)) +
+        geom_point(size = 2, alpha = 0.9) +
+        scale_color_gradient(
+          low = t_col("#4C78A8", percent = 60),
+          high = "#F58518",
+          na.value = "grey80"
+        ) +
+        labs(x = "UMAP 1", y = "UMAP 2", color = "Marker expr\n(0–100)") +
+        theme_minimal(base_size = 13) +
+        theme(panel.grid.minor = element_blank())
+    }
+  })
+  
+  output$marker_text <- renderText({
+    if (input$cell_type == "All") {
+      return("Selected cell type: All\nUMAP colored by cell type.\nSelect a specific cell type to compute marker gene.")
+    }
+    
+    g <- marker_gene()
+    d <- marker_diff()
+    paste0(
+      "Selected cell type: ", input$cell_type, "\n",
+      "Marker gene used for coloring: ", g, "\n",
+      "Marker gene diff (mean_in - mean_out): ", signif(d, 5)
+    )
+  })
+  
+  output$gene_table <- renderTable({
+    if (is.null(gene_stats())) {
+      return(data.frame(note = "Select a specific cell type to display per-gene statistics."))
+    }
+    
+    gs <- gene_stats()
+    gs <- gs[1:min(50, nrow(gs)), , drop = FALSE]
+    
+    # Rounded for readability
+    gs$det_in   <- round(gs$det_in, 4)
+    gs$det_out  <- round(gs$det_out, 4)
+    gs$mean_in  <- round(gs$mean_in, 4)
+    gs$mean_out <- round(gs$mean_out, 4)
+    gs$diff     <- round(gs$diff, 4)
+    
+    gs
+  }, striped = TRUE, spacing = "s")
+}
+
+shinyApp(ui, server)
